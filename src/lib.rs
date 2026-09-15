@@ -1,6 +1,11 @@
+mod block;
+mod chunk;
+mod world;
+mod world_generator;
+mod main_loop;
+mod chunk_mesh;
 mod texture;
 mod model;
-mod main_loop;
 mod resources;
 use std::{iter, sync::Arc};
 use cgmath::prelude::*;
@@ -26,7 +31,7 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
     cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
 );
 
-const NUM_INSTANCES_PER_ROW: u32 = 150;
+const NUM_INSTANCES_PER_ROW: u32 = 1;
 const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 1.0, 0.0, NUM_INSTANCES_PER_ROW as f32 * 1.0);
 
 pub async fn load_model(
@@ -513,6 +518,8 @@ pub struct State {
     instance_buffer: wgpu::Buffer,
     depth_texture: Texture,
     obj_model: Model,
+    world: world::World,
+    chunk_mesh: chunk_mesh::GpuChunkMesh,
 }
 
 
@@ -749,22 +756,32 @@ let camera = Camera {
     5.0,
     0.0025,
 );
-
-use std::path::Path;
-
-let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-    .join("src")
-    .join("res")
-    .join(include_str!("res/generic.obj"));
-
-println!("cwd: {:?}", std::env::current_dir());
-println!("model path: {}", path.display());
-println!("model exists: {}", path.exists());
     let obj_model =
     load_model("generic.obj", &device, &queue, &texture_bind_group_layout)
         .await
         .expect("load model failed lib:756");
 
+
+        let mut world = world::World::new();
+
+    world.generate_chunk(chunk::ChunkPos {
+        x: 0,
+        y: 0,
+        z: 0,
+    });
+
+    let chunk = world
+        .get_chunk(chunk::ChunkPos {
+            x: 0,
+            y: 0,
+            z: 0,
+        })
+        .unwrap();
+
+    let mesh = chunk_mesh::build_chunk_mesh(chunk);
+
+    let chunk_mesh =
+        chunk_mesh::GpuChunkMesh::new(&device, &mesh);
 
     Ok(Self {
         surface,
@@ -782,7 +799,9 @@ println!("model exists: {}", path.exists());
         instances,
         instance_buffer,
         depth_texture,
-        obj_model
+        obj_model,
+        world,
+        chunk_mesh
     })
 
 
@@ -799,9 +818,9 @@ println!("model exists: {}", path.exists());
         }
     }
 
-fn update(&mut self) {
+pub fn tick(&mut self, dt: f32) {
     self.camera_controller
-        .update_camera(&mut self.camera, 1.0 / 60.0);
+        .update_camera(&mut self.camera, dt);
 
     self.camera_uniform.update_view_proj(&self.camera);
 
@@ -904,19 +923,29 @@ for mesh in &self.obj_model.meshes {
         &self.camera_bind_group,
     );
 }
+render_pass.set_vertex_buffer(
+    0,
+    self.chunk_mesh.vertex_buffer.slice(..),
+);
 
+render_pass.set_index_buffer(
+    self.chunk_mesh.index_buffer.slice(..),
+    wgpu::IndexFormat::Uint32,
+);
 
-
-
-
-
+render_pass.draw_indexed(
+    0..self.chunk_mesh.num_indices,
+    0,
+    0..1,
+);
     }
-
         self.queue.submit(iter::once(encoder.finish()));
         self.queue.present(output);
 
         Ok(())
     }
+
+
 
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
@@ -931,12 +960,14 @@ for mesh in &self.obj_model.meshes {
 
 pub struct App {
     state: Option<State>,
+    game_loop: main_loop::GameLoop,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
             state: None,
+            game_loop: main_loop::GameLoop::new(),
         }
     }
 }
@@ -995,7 +1026,7 @@ impl ApplicationHandler<State> for App {
     }
 
     WindowEvent::RedrawRequested => {
-        state.update();
+        self.game_loop.update(state);
 
         match state.render() {
             Ok(_) => {}
