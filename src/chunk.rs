@@ -10,6 +10,16 @@ pub struct ChunkPos {
     pub z: i64,
 }
 
+impl ChunkPos {
+    pub fn world_origin(&self) -> [f32; 3] {
+        [
+            self.x as f32 * CHUNK_SIZE as f32,
+            self.y as f32 * CHUNK_SIZE as f32,
+            self.z as f32 * CHUNK_SIZE as f32,
+        ]
+    }
+}
+
 pub struct Chunk {
     pub position: ChunkPos,
     pub blocks: Vec<Block>,

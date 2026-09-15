@@ -23,6 +23,8 @@ use winit::{
 
 use wgpu::util::DeviceExt;
 
+use crate::block::Block;
+
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
     cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
@@ -33,6 +35,15 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
 
 const NUM_INSTANCES_PER_ROW: u32 = 1;
 const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 1.0, 0.0, NUM_INSTANCES_PER_ROW as f32 * 1.0);
+
+
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChunkUniform {
+    position: [f32; 3],
+    _padding: f32,
+}
 
 pub async fn load_model(
     file_name: &str,
@@ -525,15 +536,41 @@ pub struct State {
     obj_model: Model,
 
     world: world::World,
-    chunk_mesh: chunk_mesh::GpuChunkMesh,
+    chunk_meshes: Vec<chunk_mesh::GpuChunkMesh>,
     chunk_pipeline: wgpu::RenderPipeline,
     chunk_material_bind_group: wgpu::BindGroup,
     chunk_texture: Texture,
+
+    fps_frames: u32,
+    fps_timer: std::time::Instant,
+    last_frame: std::time::Instant,
+    chunk_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 
 
 impl State {
+    
+    pub fn update_camera(&mut self) {
+    let now = std::time::Instant::now();
+
+    let dt = now
+        .duration_since(self.last_frame)
+        .as_secs_f32();
+
+    self.last_frame = now;
+
+    self.camera_controller
+        .update_camera(&mut self.camera, dt);
+
+    self.camera_uniform.update_view_proj(&self.camera);
+
+    self.queue.write_buffer(
+        &self.camera_buffer,
+        0,
+        bytemuck::cast_slice(&[self.camera_uniform]),
+    );
+}
     async fn new(window: Arc<Window>) -> anyhow::Result<State> {
         let size = window.inner_size();
 
@@ -557,6 +594,8 @@ impl State {
                 apply_limit_buckets: true,
             })
             .await?;
+
+        println!("GPU: {:?}", adapter.get_info());
 
         let (device, queue) = adapter
     .request_device(&wgpu::DeviceDescriptor {
@@ -585,7 +624,7 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             desired_maximum_frame_latency: 2,
             view_formats: vec![],
@@ -702,32 +741,53 @@ let camera = Camera {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         }
     );
-    let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    entries: &[
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
+    
+    let camera_bind_group_layout =
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             },
-            count: None,
-        }
-    ],
-    label: Some("camera_bind_group_layout"),
-});
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    layout: &camera_bind_group_layout,
-    entries: &[
-        wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }
-    ],
-    label: Some("camera_bind_group"),
-});
+        ],
+        label: Some("camera_bind_group_layout"),
+    });
 
+    let camera_bind_group =
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &camera_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            },
+        ],
+        label: Some("camera_bind_group"),
+    });
+
+
+    let chunk_bind_group_layout =
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: Some("chunk_bind_group_layout"),
+    });
 
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -740,9 +800,10 @@ let chunk_pipeline_layout =
         &wgpu::PipelineLayoutDescriptor {
             label: Some("Chunk Pipeline Layout"),
             bind_group_layouts: &[
-                Some(&texture_bind_group_layout),
-                Some(&camera_bind_group_layout),
-            ],
+    Some(&texture_bind_group_layout), // group 0
+    Some(&camera_bind_group_layout),  // group 1
+                Some(&chunk_bind_group_layout),    // group 2
+],
             immediate_size: 0,
         }
     );
@@ -901,29 +962,42 @@ depth_compare: Some(wgpu::CompareFunction::Less),
         .expect("load model failed lib:756");
     let mut world = world::World::new();
 
-    world.generate_chunk(chunk::ChunkPos {
-        x: 0,
-        y: 0,
-        z: 0,
-    });
+let positions = [
+    chunk::ChunkPos { x: 0, y: 0, z: 0 },
+    chunk::ChunkPos { x: 1, y: 0, z: 0 },
+    chunk::ChunkPos { x: 0, y: 0, z: 1 },
+    chunk::ChunkPos { x: 1, y: 0, z: 1 },
+];
 
+// First generate ALL chunks and put them into the world.
+for position in positions {
+    let chunk = world_generator::generate_chunk(position);
+    world.add_chunk(chunk);
+}
+
+// Then build meshes.
+// Now the mesher can see neighboring chunks.
+let mut chunk_meshes = Vec::new();
+
+for position in positions {
     let chunk = world
-        .get_chunk(chunk::ChunkPos {
-            x: 0,
-            y: 0,
-            z: 0,
-        })
-        .unwrap();
+        .get_chunk(position)
+        .expect("Chunk was just generated");
 
-    let mesh = chunk_mesh::build_chunk_mesh(&chunk);
+    let mesh = chunk_mesh::build_chunk_mesh(chunk, &world);
 
-println!("vertices = {}", mesh.vertices.len());
-println!("indices  = {}", mesh.indices.len());
-println!("triangles = {}", mesh.indices.len() / 3);
+    let gpu_mesh = chunk_mesh::GpuChunkMesh::new(
+    &device,
+    &mesh,
+    position,
+    &chunk_bind_group_layout,
+);
 
-let chunk_mesh = chunk_mesh::GpuChunkMesh::new(&device, &mesh);
+    chunk_meshes.push(gpu_mesh);
+}
+world.set_block(1, 7, 1, Block::Air);
 
-    Ok(Self {
+Ok(Self {
     surface,
     device,
     queue,
@@ -947,11 +1021,16 @@ let chunk_mesh = chunk_mesh::GpuChunkMesh::new(&device, &mesh);
     obj_model,
 
     world,
-    chunk_mesh,
+    chunk_meshes,
 
     chunk_pipeline,
     chunk_texture,
     chunk_material_bind_group,
+    chunk_bind_group_layout,
+
+    fps_frames: 0,
+    fps_timer: std::time::Instant::now(),
+    last_frame: std::time::Instant::now(),
 })
 
 
@@ -968,23 +1047,110 @@ let chunk_mesh = chunk_mesh::GpuChunkMesh::new(&device, &mesh);
         }
     }
 
+    fn mark_chunk_and_neighbors_dirty(
+    &mut self,
+    pos: chunk::ChunkPos,
+) {
+    self.world.dirty_chunks.insert(pos);
+
+    let neighbors = [
+        chunk::ChunkPos {
+            x: pos.x - 1,
+            y: pos.y,
+            z: pos.z,
+        },
+        chunk::ChunkPos {
+            x: pos.x + 1,
+            y: pos.y,
+            z: pos.z,
+        },
+        chunk::ChunkPos {
+            x: pos.x,
+            y: pos.y - 1,
+            z: pos.z,
+        },
+        chunk::ChunkPos {
+            x: pos.x,
+            y: pos.y + 1,
+            z: pos.z,
+        },
+        chunk::ChunkPos {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z - 1,
+        },
+        chunk::ChunkPos {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z + 1,
+        },
+    ];
+
+    for neighbor in neighbors {
+        if self.world.chunks.contains_key(&neighbor) {
+            self.world.dirty_chunks.insert(neighbor);
+        }
+    }
+}
+    fn rebuild_dirty_chunks(&mut self) {
+    let dirty_chunks: Vec<chunk::ChunkPos> =
+        self.world.dirty_chunks.drain().collect();
+
+    for position in dirty_chunks {
+        let mesh = {
+            let Some(chunk) = self.world.get_chunk(position) else {
+                continue;
+            };
+
+            chunk_mesh::build_chunk_mesh(
+                chunk,
+                &self.world,
+            )
+        };
+
+        if let Some(gpu_mesh) = self
+            .chunk_meshes
+            .iter_mut()
+            .find(|mesh| mesh.position == position)
+        {
+            // GPU mesh already exists.
+            gpu_mesh.rebuild(
+                &self.device,
+                &mesh,
+            );
+        } else {
+            // New chunk, so create its GPU mesh.
+            let gpu_mesh = chunk_mesh::GpuChunkMesh::new(
+                &self.device,
+                &mesh,
+                position,
+                &self.chunk_bind_group_layout,
+            );
+
+            self.chunk_meshes.push(gpu_mesh);
+        }
+    }
+}
+
 pub fn tick(&mut self, dt: f32) {
-    self.camera_controller
-        .update_camera(&mut self.camera, dt);
-
-    self.camera_uniform.update_view_proj(&self.camera);
-
-    self.queue.write_buffer(
-        &self.camera_buffer,
-        0,
-        bytemuck::cast_slice(&[self.camera_uniform]),
-    );
+    self.rebuild_dirty_chunks();
 }
 
 
     fn render(&mut self) -> anyhow::Result<()> {
 
-        self.window.request_redraw();
+    self.fps_frames += 1;
+
+    if self.fps_timer.elapsed().as_secs_f32() >= 1.0 {
+        println!("FPS: {}", self.fps_frames);
+
+        self.fps_frames = 0;
+        self.fps_timer = std::time::Instant::now();
+    }
+
+    self.window.request_redraw();
+
+    // ...
 
         // We can't render unless the surface is configured
         if !self.is_surface_configured {
@@ -1066,19 +1232,7 @@ pub fn tick(&mut self, dt: f32) {
 // CHUNK
 // =========================
 
-render_pass.set_pipeline(
-    &self.chunk_pipeline
-);
-
-render_pass.set_vertex_buffer(
-    0,
-    self.chunk_mesh.vertex_buffer.slice(..),
-);
-
-render_pass.set_index_buffer(
-    self.chunk_mesh.index_buffer.slice(..),
-    wgpu::IndexFormat::Uint32,
-);
+render_pass.set_pipeline(&self.chunk_pipeline);
 
 render_pass.set_bind_group(
     0,
@@ -1092,11 +1246,29 @@ render_pass.set_bind_group(
     &[],
 );
 
-render_pass.draw_indexed(
-    0..self.chunk_mesh.num_indices,
-    0,
-    0..1,
-);
+for chunk_mesh in &self.chunk_meshes {
+    render_pass.set_bind_group(
+        2,
+        &chunk_mesh.bind_group,
+        &[],
+    );
+
+    render_pass.set_vertex_buffer(
+        0,
+        chunk_mesh.vertex_buffer.slice(..),
+    );
+
+    render_pass.set_index_buffer(
+        chunk_mesh.index_buffer.slice(..),
+        wgpu::IndexFormat::Uint32,
+    );
+
+    render_pass.draw_indexed(
+        0..chunk_mesh.num_indices,
+        0,
+        0..1,
+    );
+}
     }
         self.queue.submit(iter::once(encoder.finish()));
         self.queue.present(output);
@@ -1185,16 +1357,20 @@ impl ApplicationHandler<State> for App {
     }
 
     WindowEvent::RedrawRequested => {
-        self.game_loop.update(state);
+    // 20 TPS game simulation
+    self.game_loop.update(state);
 
-        match state.render() {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("{e}");
-                event_loop.exit();
-            }
+    // Camera/input update every rendered frame
+    state.update_camera();
+
+    match state.render() {
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("{e}");
+            event_loop.exit();
         }
     }
+}
 
     WindowEvent::KeyboardInput {
         event:

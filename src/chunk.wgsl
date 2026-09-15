@@ -5,6 +5,16 @@ struct CameraUniform {
 @group(1) @binding(0)
 var<uniform> camera: CameraUniform;
 
+
+struct ChunkUniform {
+    position: vec3<f32>,
+    _padding: f32,
+};
+
+@group(2) @binding(0)
+var<uniform> chunk: ChunkUniform;
+
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) tex_coords: vec2<f32>,
@@ -13,20 +23,41 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+    @location(1) normal: vec3<f32>,
 };
+
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
+    let world_position =
+        model.position + chunk.position;
+
     out.clip_position =
         camera.view_proj *
-        vec4<f32>(model.position, 1.0);
+        vec4<f32>(world_position, 1.0);
+
+    out.tex_coords = model.tex_coords;
+    out.normal = model.normal;
 
     return out;
 }
 
+
+@group(0) @binding(0)
+var t_diffuse: texture_2d<f32>;
+
+@group(0) @binding(1)
+var s_diffuse: sampler;
+
+
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.2, 0.8, 0.2, 1.0);
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(
+        t_diffuse,
+        s_diffuse,
+        in.tex_coords
+    );
 }

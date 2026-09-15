@@ -2,6 +2,8 @@ use crate::block::Block;
 use crate::chunk::{Chunk, CHUNK_SIZE};
 use crate::model::ModelVertex;
 use wgpu::util::DeviceExt;
+use crate::chunk::ChunkPos;
+use crate::world;
 
 pub struct ChunkMesh {
     pub vertices: Vec<ModelVertex>,
@@ -12,12 +14,18 @@ pub struct GpuChunkMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
+    pub position: ChunkPos,
+
+    pub uniform_buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
 }
 
 impl GpuChunkMesh {
     pub fn new(
         device: &wgpu::Device,
         mesh: &ChunkMesh,
+        position: ChunkPos,
+        chunk_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -35,15 +43,76 @@ impl GpuChunkMesh {
             },
         );
 
+        let world_position = position.world_origin();
+
+        let uniform = crate::ChunkUniform {
+            position: world_position,
+            _padding: 0.0,
+        };
+
+        let uniform_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk Uniform Buffer"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: chunk_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                ],
+                label: Some("chunk_bind_group"),
+            },
+        );
+
         Self {
             vertex_buffer,
             index_buffer,
             num_indices: mesh.indices.len() as u32,
+            position,
+            uniform_buffer,
+            bind_group,
         }
     }
 }
 
-pub fn build_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
+impl GpuChunkMesh {
+    pub fn rebuild(
+        &mut self,
+        device: &wgpu::Device,
+        mesh: &ChunkMesh,
+    ) {
+        self.vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk Vertex Buffer"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+
+        self.index_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Chunk Index Buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
+
+        self.num_indices = mesh.indices.len() as u32;
+    }
+}
+
+pub fn build_chunk_mesh(
+    chunk: &Chunk,
+    world: &world::World,
+) -> ChunkMesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
@@ -56,72 +125,29 @@ pub fn build_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
                     continue;
                 }
 
-                // Check each of the 6 sides.
-                if is_air(chunk, x as i32 + 1, y as i32, z as i32) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Right,
-                    );
-                }
+                if get_block(chunk, world, x as i32 + 1, y as i32, z as i32) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Right);
+}
 
-                if is_air(chunk, x as i32 - 1, y as i32, z as i32) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Left,
-                    );
-                }
+if get_block(chunk, world, x as i32 - 1, y as i32, z as i32) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Left);
+}
 
-                if is_air(chunk, x as i32, y as i32 + 1, z as i32) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Top,
-                    );
-                }
+if get_block(chunk, world, x as i32, y as i32 + 1, z as i32) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Top);
+}
 
-                if is_air(chunk, x as i32, y as i32 - 1, z as i32) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Bottom,
-                    );
-                }
+if get_block(chunk, world, x as i32, y as i32 - 1, z as i32) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Bottom);
+}
 
-                if is_air(chunk, x as i32, y as i32, z as i32 + 1) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Front,
-                    );
-                }
+if get_block(chunk, world, x as i32, y as i32, z as i32 + 1) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Front);
+}
 
-                if is_air(chunk, x as i32, y as i32, z as i32 - 1) {
-                    add_face(
-                        &mut vertices,
-                        &mut indices,
-                        x as f32,
-                        y as f32,
-                        z as f32,
-                        Face::Back,
-                    );
-                }
+if get_block(chunk, world, x as i32, y as i32, z as i32 - 1) == Block::Air {
+    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Back);
+}
             }
         }
     }
@@ -130,18 +156,68 @@ pub fn build_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
     ChunkMesh { vertices, indices }
 }
 
-fn is_air(chunk: &Chunk, x: i32, y: i32, z: i32) -> bool {
-    if x < 0
-        || x >= CHUNK_SIZE as i32
-        || y < 0
-        || y >= CHUNK_SIZE as i32
-        || z < 0
-        || z >= CHUNK_SIZE as i32
+fn get_block(
+    chunk: &Chunk,
+    world: &world::World,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Block {
+    // Inside this chunk
+    if x >= 0
+        && x < CHUNK_SIZE as i32
+        && y >= 0
+        && y < CHUNK_SIZE as i32
+        && z >= 0
+        && z < CHUNK_SIZE as i32
     {
-        return true;
+        return chunk.get(
+            x as usize,
+            y as usize,
+            z as usize,
+        );
     }
 
-    chunk.get(x as usize, y as usize, z as usize) == Block::Air
+    // Outside this chunk: determine which neighboring chunk
+    // contains the requested block.
+    let mut chunk_pos = chunk.position;
+
+    let mut local_x = x;
+    let mut local_y = y;
+    let mut local_z = z;
+
+    if local_x < 0 {
+        chunk_pos.x -= 1;
+        local_x += CHUNK_SIZE as i32;
+    } else if local_x >= CHUNK_SIZE as i32 {
+        chunk_pos.x += 1;
+        local_x -= CHUNK_SIZE as i32;
+    }
+
+    if local_y < 0 {
+        chunk_pos.y -= 1;
+        local_y += CHUNK_SIZE as i32;
+    } else if local_y >= CHUNK_SIZE as i32 {
+        chunk_pos.y += 1;
+        local_y -= CHUNK_SIZE as i32;
+    }
+
+    if local_z < 0 {
+        chunk_pos.z -= 1;
+        local_z += CHUNK_SIZE as i32;
+    } else if local_z >= CHUNK_SIZE as i32 {
+        chunk_pos.z += 1;
+        local_z -= CHUNK_SIZE as i32;
+    }
+
+    match world.get_chunk(chunk_pos) {
+        Some(neighbor) => neighbor.get(
+            local_x as usize,
+            local_y as usize,
+            local_z as usize,
+        ),
+        None => Block::Air,
+    }
 }
 
 #[derive(Clone, Copy)]
