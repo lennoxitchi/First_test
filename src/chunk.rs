@@ -1,8 +1,7 @@
 use crate::block::Block;
 
 pub const CHUNK_SIZE: usize = 16;
-pub const CHUNK_VOLUME: usize =
-    CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkPos {

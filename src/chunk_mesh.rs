@@ -125,6 +125,7 @@ pub fn build_chunk_mesh(chunk: &Chunk) -> ChunkMesh {
             }
         }
     }
+    
 
     ChunkMesh { vertices, indices }
 }

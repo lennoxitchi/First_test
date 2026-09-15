@@ -508,18 +508,27 @@ pub struct State {
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
     window: Arc<Window>,
+
     render_pipeline: wgpu::RenderPipeline,
+
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
+
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
+
     depth_texture: Texture,
+
     obj_model: Model,
+
     world: world::World,
     chunk_mesh: chunk_mesh::GpuChunkMesh,
+    chunk_pipeline: wgpu::RenderPipeline,
+    chunk_material_bind_group: wgpu::BindGroup,
+    chunk_texture: Texture,
 }
 
 
@@ -612,6 +621,38 @@ impl State {
                 label: Some("texture_bind_group_layout"),
               });
 
+              let chunk_texture =
+            load_texture("dirt.png", &device, &queue).await?;
+
+        let chunk_material_bind_group =
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &chunk_texture.view
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(
+                            &chunk_texture.sampler
+                        ),
+                    },
+                ],
+                label: Some("chunk_material_bind_group"),
+            });
+
+            let chunk_shader =
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Chunk Shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("chunk.wgsl").into()
+                    ),
+                });
+
+                
     let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
             (0..NUM_INSTANCES_PER_ROW).map(move |x| {
                 let position = cgmath::Vector3 { x: (x as f32)*2.0 , y: (x as f32).sin()*10.0, z: (z as f32)*2.0 } - INSTANCE_DISPLACEMENT;
@@ -694,6 +735,104 @@ let camera = Camera {
     source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
 });
 
+let chunk_pipeline_layout =
+    device.create_pipeline_layout(
+        &wgpu::PipelineLayoutDescriptor {
+            label: Some("Chunk Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&texture_bind_group_layout),
+                Some(&camera_bind_group_layout),
+            ],
+            immediate_size: 0,
+        }
+    );
+
+    let chunk_pipeline =
+    device.create_render_pipeline(
+        &wgpu::RenderPipelineDescriptor {
+            label: Some("Chunk Pipeline"),
+            layout: Some(&chunk_pipeline_layout),
+
+            vertex: wgpu::VertexState {
+                module: &chunk_shader,
+                entry_point: Some("vs_main"),
+
+                buffers: &[
+                    Some(model::ModelVertex::desc()),
+                ],
+
+                compilation_options:
+                    wgpu::PipelineCompilationOptions::default(),
+            },
+
+            fragment: Some(wgpu::FragmentState {
+                module: &chunk_shader,
+                entry_point: Some("fs_main"),
+
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: config.format,
+
+                        blend: Some(
+                            wgpu::BlendState::REPLACE
+                        ),
+
+                        write_mask:
+                            wgpu::ColorWrites::ALL,
+                    })
+                ],
+
+                compilation_options:
+                    wgpu::PipelineCompilationOptions::default(),
+            }),
+
+            primitive: wgpu::PrimitiveState {
+                topology:
+                    wgpu::PrimitiveTopology::TriangleList,
+
+                strip_index_format: None,
+
+                front_face:
+                    wgpu::FrontFace::Ccw,
+
+                cull_mode:
+                    Some(wgpu::Face::Back),
+
+                polygon_mode:
+                    wgpu::PolygonMode::Fill,
+
+                unclipped_depth: false,
+                conservative: false,
+            },
+
+            depth_stencil: Some(
+                wgpu::DepthStencilState {
+                    format:
+                        texture::Texture::DEPTH_FORMAT,
+
+                    depth_write_enabled: Some(true),
+depth_compare: Some(wgpu::CompareFunction::Less),
+
+                    stencil:
+                        wgpu::StencilState::default(),
+
+                    bias:
+                        wgpu::DepthBiasState::default(),
+                }
+            ),
+
+            multisample:
+                wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+
+            multiview_mask: None,
+            cache: None,
+        }
+    );
+
         let render_pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -760,9 +899,7 @@ let camera = Camera {
     load_model("generic.obj", &device, &queue, &texture_bind_group_layout)
         .await
         .expect("load model failed lib:756");
-
-
-        let mut world = world::World::new();
+    let mut world = world::World::new();
 
     world.generate_chunk(chunk::ChunkPos {
         x: 0,
@@ -778,31 +915,44 @@ let camera = Camera {
         })
         .unwrap();
 
-    let mesh = chunk_mesh::build_chunk_mesh(chunk);
+    let mesh = chunk_mesh::build_chunk_mesh(&chunk);
 
-    let chunk_mesh =
-        chunk_mesh::GpuChunkMesh::new(&device, &mesh);
+println!("vertices = {}", mesh.vertices.len());
+println!("indices  = {}", mesh.indices.len());
+println!("triangles = {}", mesh.indices.len() / 3);
+
+let chunk_mesh = chunk_mesh::GpuChunkMesh::new(&device, &mesh);
 
     Ok(Self {
-        surface,
-        device,
-        queue,
-        config,
-        is_surface_configured: false,
-        window,
-        render_pipeline,
-        camera,
-        camera_uniform,
-        camera_buffer,
-        camera_bind_group,
-        camera_controller,
-        instances,
-        instance_buffer,
-        depth_texture,
-        obj_model,
-        world,
-        chunk_mesh
-    })
+    surface,
+    device,
+    queue,
+    config,
+    is_surface_configured: false,
+    window,
+
+    render_pipeline,
+
+    camera,
+    camera_uniform,
+    camera_buffer,
+    camera_bind_group,
+    camera_controller,
+
+    instances,
+    instance_buffer,
+
+    depth_texture,
+
+    obj_model,
+
+    world,
+    chunk_mesh,
+
+    chunk_pipeline,
+    chunk_texture,
+    chunk_material_bind_group,
+})
 
 
 
@@ -909,20 +1059,17 @@ pub fn tick(&mut self, dt: f32) {
     });
     
 // lib.rs
-render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+//
 
-render_pass.set_pipeline(&self.render_pipeline);
 
-for mesh in &self.obj_model.meshes {
-    let material = &self.obj_model.materials[mesh.material];
+// =========================
+// CHUNK
+// =========================
 
-    render_pass.draw_mesh_instanced(
-        mesh,
-        material,
-        0..self.instances.len() as u32,
-        &self.camera_bind_group,
-    );
-}
+render_pass.set_pipeline(
+    &self.chunk_pipeline
+);
+
 render_pass.set_vertex_buffer(
     0,
     self.chunk_mesh.vertex_buffer.slice(..),
@@ -931,6 +1078,18 @@ render_pass.set_vertex_buffer(
 render_pass.set_index_buffer(
     self.chunk_mesh.index_buffer.slice(..),
     wgpu::IndexFormat::Uint32,
+);
+
+render_pass.set_bind_group(
+    0,
+    &self.chunk_material_bind_group,
+    &[],
+);
+
+render_pass.set_bind_group(
+    1,
+    &self.camera_bind_group,
+    &[],
 );
 
 render_pass.draw_indexed(
