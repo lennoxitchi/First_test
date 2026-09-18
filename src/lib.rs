@@ -9,7 +9,8 @@ mod chunk_worker;
 mod model;
 mod resources;
 mod block_model;
-use std::collections::{HashMap, HashSet};
+mod block_registry;
+use std::collections::{ HashSet};
 use std::{iter, sync::Arc};
 use cgmath::prelude::*;
 use texture::*;
@@ -25,8 +26,7 @@ use winit::{
 };
 
 use wgpu::util::DeviceExt;
-
-use crate::block::Block;
+use crate::block_registry::BlockRegistry;
 use crate::chunk::ChunkPos;
 
 #[rustfmt::skip]
@@ -37,15 +37,19 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
     cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
 );
 
-const NUM_INSTANCES_PER_ROW: u32 = 1;
-const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 1.0, 0.0, NUM_INSTANCES_PER_ROW as f32 * 1.0);
-
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct ChunkUniform {
     position: [f32; 3],
     _padding: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AtlasUniform {
+    columns: u32,
+    rows: u32,
 }
 
 pub async fn load_model(
@@ -265,20 +269,6 @@ impl InstanceRaw {
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],
-        }
-    }
-}
-
-struct Instance {
-    position: cgmath::Vector3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-}
-
-// NEW!
-impl Instance {
-    fn to_raw(&self) -> InstanceRaw {
-        InstanceRaw {
-            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
         }
     }
 }
@@ -652,26 +642,18 @@ pub(crate) device: wgpu::Device,
     is_surface_configured: bool,
     window: Arc<Window>,
 
-    render_pipeline: wgpu::RenderPipeline,
-
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
 
-    instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
-
     depth_texture: Texture,
-
-    obj_model: Model,
 
     pub(crate) world: world::World,
 pub(crate) chunk_meshes: Vec<chunk_mesh::GpuChunkMesh>,
     chunk_pipeline: wgpu::RenderPipeline,
     chunk_material_bind_group: wgpu::BindGroup,
-    chunk_texture: Texture,
 
     fps_frames: u32,
     fps_timer: std::time::Instant,
@@ -682,32 +664,12 @@ pub(crate) chunk_worker: chunk_worker::ChunkWorker,
 pub(crate) pending_chunks: HashSet<chunk::ChunkPos>,
 pending_remeshes: HashSet<ChunkPos>,
 pub(crate) remesh_again: HashSet<chunk::ChunkPos>,
-pub(crate) lod1_meshes: HashMap<chunk::ChunkPos, chunk_mesh::GpuChunkMesh>,
+atlas_bind_group: wgpu::BindGroup,
 }
 
 
 
 impl State {
-
-    fn distance_squared(
-    &self,
-    position: chunk::ChunkPos,
-    size: f32,
-) -> f32 {
-    let origin = position.world_origin();
-
-    let half = size * 0.5;
-
-    let center_x = origin[0] + half;
-    let center_y = origin[1] + half;
-    let center_z = origin[2] + half;
-
-    let dx = center_x - self.camera.position.x;
-    let dy = center_y - self.camera.position.y;
-    let dz = center_z - self.camera.position.z;
-
-    dx * dx + dy * dy + dz * dz
-}
     
     pub fn update_camera(&mut self) {
     let now = std::time::Instant::now();
@@ -818,8 +780,59 @@ impl State {
                 label: Some("texture_bind_group_layout"),
               });
 
-              let chunk_texture =
-            load_texture("dirt.png", &device, &queue).await?;
+            let atlas = TextureAtlas::build(
+                &device,
+                &queue,
+                16,
+            )?;
+
+            let block_registry = BlockRegistry::new(&atlas)?;
+
+            let atlas_uniform = AtlasUniform {
+    columns: atlas.columns,
+    rows: atlas.rows,
+};
+
+let atlas_buffer = device.create_buffer_init(
+    &wgpu::util::BufferInitDescriptor {
+        label: Some("Atlas Uniform"),
+        contents: bytemuck::bytes_of(&atlas_uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
+    },
+);
+
+let atlas_bind_group_layout =
+    device.create_bind_group_layout(
+        &wgpu::BindGroupLayoutDescriptor {
+            label: Some("Atlas Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        },
+    );
+
+let atlas_bind_group =
+    device.create_bind_group(
+        &wgpu::BindGroupDescriptor {
+            label: Some("Atlas Bind Group"),
+            layout: &atlas_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: atlas_buffer.as_entire_binding(),
+                },
+            ],
+        },
+    );
 
         let chunk_material_bind_group =
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -828,13 +841,13 @@ impl State {
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::TextureView(
-                            &chunk_texture.view
+                            &atlas.texture.view
                         ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(
-                            &chunk_texture.sampler
+                            &atlas.texture.sampler
                         ),
                     },
                 ],
@@ -848,33 +861,6 @@ impl State {
                         include_str!("chunk.wgsl").into()
                     ),
                 });
-
-                
-    let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
-            (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                let position = cgmath::Vector3 { x: (x as f32)*2.0 , y: (x as f32).sin()*10.0, z: (z as f32)*2.0 } - INSTANCE_DISPLACEMENT;
-
-                let rotation = if position.is_zero() {
-                    // this is needed so an object at (0, 0, 0) won't get scaled to zero
-                    // as Quaternions can affect scale if they're not created correctly
-                    cgmath::Quaternion::new(1.0, 0.0, 0.0, 0.0)
-                } else {
-                    cgmath::Quaternion::new(1.0, 0.0, 0.0, 0.0)
-                };
-
-                Instance {
-                    position, rotation,
-                }
-            })
-        }).collect::<Vec<_>>();
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-let instance_buffer = device.create_buffer_init(
-    &wgpu::util::BufferInitDescriptor {
-        label: Some("Instance Buffer"),
-        contents: bytemuck::cast_slice(&instance_data),
-        usage: wgpu::BufferUsages::VERTEX,
-    }
-);
 
 let camera = Camera {
     position: (0.0, 15.0, 10.0).into(),
@@ -947,20 +933,15 @@ let camera = Camera {
         label: Some("chunk_bind_group_layout"),
     });
 
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-    label: Some("Shader"),
-    source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-});
-
 let chunk_pipeline_layout =
     device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("Chunk Pipeline Layout"),
             bind_group_layouts: &[
-    Some(&texture_bind_group_layout), // group 0
-    Some(&camera_bind_group_layout),  // group 1
+                Some(&texture_bind_group_layout), // group 0
+                Some(&camera_bind_group_layout),  // group 1
                 Some(&chunk_bind_group_layout),    // group 2
+                Some(&atlas_bind_group_layout), // 3 bro
 ],
             immediate_size: 0,
         }
@@ -1052,75 +1033,13 @@ depth_compare: Some(wgpu::CompareFunction::Less),
         }
     );
 
-        let render_pipeline_layout = device.create_pipeline_layout(
-        &wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-        bind_group_layouts: &[
-            Some(&texture_bind_group_layout),
-            Some(&camera_bind_group_layout),
-        ],
-            immediate_size: 0,
-        }
-    );
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"), // 1.
-                buffers: &[Some(model::ModelVertex::desc()), Some(InstanceRaw::desc())],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState { // 3.
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState { // 4.
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-                primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList, // 1.
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw, // 2.
-            cull_mode: Some(wgpu::Face::Back),
-            // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // Requires Features::DEPTH_CLIP_CONTROL
-            unclipped_depth: false,
-            // Requires Features::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-            depth_stencil: Some(wgpu::DepthStencilState {
-        format: texture::Texture::DEPTH_FORMAT,
-        depth_write_enabled: Some(true),
-        depth_compare: Some(wgpu::CompareFunction::Less), // 1.
-        stencil: wgpu::StencilState::default(), // 2.
-        bias: wgpu::DepthBiasState::default(),
-    }),
-        multisample: wgpu::MultisampleState {
-            count: 1, // 2.
-            mask: !0, // 3.
-            alpha_to_coverage_enabled: false, // 4.
-        },
-        multiview_mask: None, // 5.
-        cache: None, // 6.
-        });
-
     let camera_controller = CameraController::new(
     15.0,
     0.0025,
 );
-    let obj_model =
-    load_model("generic.obj", &device, &queue, &texture_bind_group_layout)
-        .await
-        .expect("load model failed lib:756");
 
 
-let chunk_worker = chunk_worker::ChunkWorker::new();
+let chunk_worker = chunk_worker::ChunkWorker::new(block_registry);
 
 let world = world::World::new();
 
@@ -1134,26 +1053,17 @@ Ok(Self {
     is_surface_configured: false,
     window,
 
-    render_pipeline,
-
     camera,
     camera_uniform,
     camera_buffer,
     camera_bind_group,
     camera_controller,
-
-    instances,
-    instance_buffer,
-
     depth_texture,
-
-    obj_model,
 
     world,
     chunk_meshes,
 
     chunk_pipeline,
-    chunk_texture,
     chunk_material_bind_group,
     chunk_bind_group_layout,
 
@@ -1165,8 +1075,7 @@ Ok(Self {
     pending_chunks: HashSet::new(),
     pending_remeshes: HashSet::new(),
     remesh_again: HashSet::new(),
-    lod1_meshes: HashMap::new(),
-    
+    atlas_bind_group,
 })
 
 
@@ -1293,6 +1202,12 @@ render_pass.set_bind_group(
 render_pass.set_bind_group(
     1,
     &self.camera_bind_group,
+    &[],
+);
+
+render_pass.set_bind_group(
+    3,
+    &self.atlas_bind_group,
     &[],
 );
 

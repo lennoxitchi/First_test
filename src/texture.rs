@@ -1,5 +1,121 @@
-use image::GenericImageView;
-use anyhow::*;
+use anyhow::{anyhow, Result};
+use image::{DynamicImage, GenericImageView, RgbaImage};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub struct TextureAtlas {
+    pub texture: Texture,
+
+    /// Texture name -> tile index
+    pub indices: HashMap<String, u32>,
+
+    pub tile_size: u32,
+    pub columns: u32,
+    pub rows: u32,
+}
+
+impl TextureAtlas {
+    pub fn build(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tile_size: u32,
+    ) -> Result<Self> {
+        // These are embedded into the executable at compile time.
+        let textures: &[(&str, &[u8])] = &[
+            ("stone", include_bytes!("res/assets/stone.png")),
+            ("dirt", include_bytes!("res/assets/dirt.png")),
+            ("grass_side", include_bytes!("res/assets/grass_side.png"),  ),
+            ("grass_top", include_bytes!("res/assets/grass_top.png"),  ),
+        ];
+
+        if textures.is_empty() {
+            return Err(anyhow!("No textures defined"));
+        }
+
+        let mut images = Vec::with_capacity(textures.len());
+
+        for (name, bytes) in textures {
+            let image = image::load_from_memory(bytes)?;
+
+            if image.width() != tile_size
+                || image.height() != tile_size
+            {
+                return Err(anyhow!(
+                    "Texture '{}' is {}x{}, expected {}x{}",
+                    name,
+                    image.width(),
+                    image.height(),
+                    tile_size,
+                    tile_size
+                ));
+            }
+
+            images.push(image.to_rgba8());
+        }
+
+        let texture_count = images.len() as u32;
+
+        let columns =
+            (texture_count as f32).sqrt().ceil() as u32;
+
+        let rows =
+            (texture_count + columns - 1) / columns;
+
+        let atlas_width = columns * tile_size;
+        let atlas_height = rows * tile_size;
+
+        let mut atlas =
+            RgbaImage::new(atlas_width, atlas_height);
+
+        let mut indices = HashMap::new();
+
+        for (index, ((name, _), image)) in
+            textures.iter().zip(images.iter()).enumerate()
+        {
+            let index = index as u32;
+
+            let x = (index % columns) * tile_size;
+            let y = (index / columns) * tile_size;
+
+            image::imageops::replace(
+                &mut atlas,
+                image,
+                x as i64,
+                y as i64,
+            );
+
+            indices.insert((*name).to_string(), index);
+        }
+
+        let dynamic =
+            DynamicImage::ImageRgba8(atlas);
+
+        let texture = Texture::from_image(
+            device,
+            queue,
+            &dynamic,
+            Some("Block Texture Atlas"),
+        )?;
+
+        Ok(Self {
+            texture,
+            indices,
+            tile_size,
+            columns,
+            rows,
+        })
+    }
+
+    pub fn index(&self, name: &str) -> Result<u32> {
+        self.indices
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!("Texture '{}' does not exist", name)
+            })
+    }
+}
 
 pub struct Texture {
     #[allow(unused)]
@@ -104,18 +220,18 @@ impl Texture {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(
-    &wgpu::SamplerDescriptor {
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::Repeat,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
+            &wgpu::SamplerDescriptor {
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
 
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
 
-        ..Default::default()
-    }
-);
+                ..Default::default()
+            }
+        );
 
         Ok(Self { texture, view, sampler })
     }

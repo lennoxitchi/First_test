@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::block_registry::BlockRegistry;
 use crate::chunk::{Chunk, ChunkPos, ChunkSnapshot};
 use crate::chunk_mesh;
 use crate::world_generator;
@@ -30,7 +31,7 @@ pub struct ChunkWorker {
 }
 
 impl ChunkWorker {
-    pub fn new() -> Self {
+    pub fn new(registry: BlockRegistry) -> Self {
         let (request_sender, request_receiver) =
             mpsc::channel::<ChunkRequest>();
 
@@ -54,6 +55,7 @@ impl ChunkWorker {
                             chunk_mesh::build_chunk_mesh(
                                 &snapshot,
                                 &neighbors,
+                                &registry,
                             );
 
                         if result_sender
@@ -77,6 +79,7 @@ impl ChunkWorker {
                             chunk_mesh::build_chunk_mesh(
                                 &chunk,
                                 &neighbors,
+                                &registry,
                             );
 
                         if result_sender

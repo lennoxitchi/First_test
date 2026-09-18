@@ -14,6 +14,14 @@ struct ChunkUniform {
 @group(2) @binding(0)
 var<uniform> chunk: ChunkUniform;
 
+struct AtlasUniform {
+    columns: u32,
+    rows: u32,
+};
+
+@group(3) @binding(0)
+var<uniform> atlas: AtlasUniform;
+
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -22,11 +30,12 @@ struct VertexInput {
     @location(3) texture_index: u32,
 };
 
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) texture_index: u32,
+    @location(2) @interpolate(flat) texture_index: u32,
 };
 
 
@@ -56,34 +65,38 @@ var t_diffuse: texture_2d<f32>;
 var s_diffuse: sampler;
 
 
-const ATLAS_COLUMNS: f32 = 3.0;
-const ATLAS_ROWS: f32 = 1.0;
-
 fn atlas_uv(
     uv: vec2<f32>,
     texture_index: u32
 ) -> vec2<f32> {
+    let columns = f32(atlas.columns);
+    let rows = f32(atlas.rows);
+
     let index = f32(texture_index);
 
-    let column = index % ATLAS_COLUMNS;
-    let row = floor(index / ATLAS_COLUMNS);
+    let column = index % columns;
+    let row = floor(index / columns);
 
     let tile_size = vec2<f32>(
-        1.0 / ATLAS_COLUMNS,
-        1.0 / ATLAS_ROWS
+        1.0 / columns,
+        1.0 / rows
     );
 
-    return vec2<f32>(
-        column * tile_size.x + uv.x * tile_size.x,
-        row * tile_size.y + uv.y * tile_size.y
+    // Repeat once per block.
+    let local_uv = fract(uv);
+
+    let tile_origin = vec2<f32>(
+        column * tile_size.x,
+        row * tile_size.y
     );
+
+    return tile_origin + local_uv * tile_size;
 }
-
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = atlas_uv(
-        fract(in.tex_coords),
+        in.tex_coords,
         in.texture_index
     );
 

@@ -1,7 +1,9 @@
 use crate::block::Block;
 use crate::block_model::BlockModel;
+use crate::block_registry::BlockRegistry;
 use crate::chunk::{CHUNK_SIZE, Chunk, ChunkSnapshot};
 use crate::model::ModelVertex;
+use crate::texture::TextureAtlas;
 use wgpu::util::DeviceExt;
 use crate::chunk::ChunkPos;
 use crate::world;
@@ -120,6 +122,7 @@ impl GpuChunkMesh {
 pub fn build_chunk_mesh(
     chunk: &ChunkSnapshot,
     neighbors: &[Option<ChunkSnapshot>; 6],
+    registry: &BlockRegistry,
 ) -> ChunkMesh {
     build_greedy_mesh(
         |x, y, z| {
@@ -132,6 +135,7 @@ pub fn build_chunk_mesh(
             )
         },
         1.0,
+        registry,
     )
 }
 
@@ -139,8 +143,9 @@ fn cube_texture(
     block: Block,
     axis: usize,
     positive: bool,
+    registry: &BlockRegistry,
 ) -> u32 {
-    let Some(BlockModel::Cube(cube)) = block.model() else {
+    let Some(BlockModel::Cube(cube)) = registry.model(block) else {
         return 0;
     };
 
@@ -164,6 +169,7 @@ fn cube_texture(
 fn build_greedy_mesh<F>(
     mut get_block: F,
     scale: f32,
+    registry: &BlockRegistry,
 ) -> ChunkMesh
 where
     F: FnMut(i32, i32, i32) -> Block,
@@ -214,6 +220,7 @@ where
             block_a,
             axis,
             true,
+            registry,
         ),
     })
 } else if block_b != Block::Air
@@ -226,6 +233,7 @@ where
             block_b,
             axis,
             false,
+            registry,
         ),
     })
 } else {
@@ -346,10 +354,15 @@ fn add_greedy_quad_scaled(
 ) {
     let start = vertices.len() as u32;
 
+    // These are the geometry axes used by the greedy mask.
+    //
+    // X face: rectangle is Y × Z
+    // Y face: rectangle is X × Z
+    // Z face: rectangle is X × Y
     let (u_axis, v_axis) = match axis {
-        0 => (1, 2),
-        1 => (0, 2),
-        2 => (0, 1),
+        0 => (1, 2), // X: U-geometry = Y, V-geometry = Z
+        1 => (0, 2), // Y: U-geometry = X, V-geometry = Z
+        2 => (0, 1), // Z: U-geometry = X, V-geometry = Y
         _ => unreachable!(),
     };
 
@@ -385,30 +398,141 @@ fn add_greedy_quad_scaled(
         origin[2] + dv[2],
     ];
 
-    let mut normal = [0.0f32; 3];
+    let normal = {
+        let mut n = [0.0f32; 3];
+        n[axis] = if positive { 1.0 } else { -1.0 };
+        n
+    };
 
-    normal[axis] =
-        if positive { 1.0 } else { -1.0 };
+    /*
+     * Texture coordinates
+     *
+     * The important part is that every face gets a proper:
+     *
+     *     U = horizontal
+     *     V = vertical
+     *
+     * orientation.
+     *
+     * UVs are in BLOCK units. Therefore a 3x2 greedy quad
+     * gets UVs covering 3x2 texture repetitions.
+     */
 
-    let positions = match (axis, positive) {
-        (0, true) => [p0, p1, p2, p3],
-        (0, false) => [p0, p3, p2, p1],
+    let (positions, tex_coords) = match (axis, positive) {
 
-        (1, true) => [p0, p3, p2, p1],
-        (1, false) => [p0, p1, p2, p3],
+        // =========================================================
+        // EAST (+X)
+        //
+        // Geometry dimensions:
+        //     width  = Y
+        //     height = Z
+        //
+        // Texture:
+        //     horizontal = Z
+        //     vertical   = Y
+        // =========================================================
 
-        (2, true) => [p0, p1, p2, p3],
-        (2, false) => [p0, p3, p2, p1],
+        (0, true) => (
+            [p0, p1, p2, p3],
+            [
+                [0.0, width as f32],
+                [0.0, 0.0],
+                [height as f32, 0.0],
+                [height as f32, width as f32],
+            ],
+        ),
+
+        // =========================================================
+        // WEST (-X)
+        //
+        // Same texture orientation as east, but reverse the
+        // geometry winding because the normal points -X.
+        // =========================================================
+
+        (0, false) => (
+            [p0, p3, p2, p1],
+            [
+                [0.0, width as f32],
+                [height as f32, width as f32],
+                [height as f32, 0.0],
+                [0.0, 0.0],
+            ],
+        ),
+
+        // =========================================================
+        // TOP (+Y)
+        //
+        // Geometry:
+        //     width  = X
+        //     height = Z
+        //
+        // Texture:
+        //     horizontal = X
+        //     vertical   = Z
+        // =========================================================
+
+        (1, true) => (
+            [p0, p3, p2, p1],
+            [
+                [0.0, 0.0],
+                [0.0, height as f32],
+                [width as f32, height as f32],
+                [width as f32, 0.0],
+            ],
+        ),
+
+        // =========================================================
+        // BOTTOM (-Y)
+        // =========================================================
+
+        (1, false) => (
+            [p0, p1, p2, p3],
+            [
+                [0.0, 0.0],
+                [width as f32, 0.0],
+                [width as f32, height as f32],
+                [0.0, height as f32],
+            ],
+        ),
+
+        // =========================================================
+        // SOUTH (+Z)
+        //
+        // Geometry:
+        //     width  = X
+        //     height = Y
+        //
+        // Texture:
+        //     horizontal = X
+        //     vertical   = Y
+        // =========================================================
+
+        (2, true) => (
+            [p0, p1, p2, p3],
+            [
+                [0.0, height as f32],
+                [width as f32, height as f32],
+                [width as f32, 0.0],
+                [0.0, 0.0],
+            ],
+        ),
+
+        // =========================================================
+        // NORTH (-Z)
+        // =========================================================
+
+        (2, false) => (
+            [p0, p3, p2, p1],
+            [
+                [0.0, height as f32],
+                [width as f32, height as f32],
+                [width as f32, 0.0],
+                [0.0, 0.0],
+            ],
+        ),
 
         _ => unreachable!(),
     };
-
-    let tex_coords = [
-        [0.0, height as f32],
-        [width as f32, height as f32],
-        [width as f32, 0.0],
-        [0.0, 0.0],
-    ];
 
     for i in 0..4 {
         vertices.push(ModelVertex {
