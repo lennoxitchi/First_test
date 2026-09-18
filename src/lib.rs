@@ -5,8 +5,11 @@ mod world_generator;
 mod main_loop;
 mod chunk_mesh;
 mod texture;
+mod chunk_worker;
 mod model;
 mod resources;
+mod block_model;
+use std::collections::{HashMap, HashSet};
 use std::{iter, sync::Arc};
 use cgmath::prelude::*;
 use texture::*;
@@ -24,6 +27,7 @@ use winit::{
 use wgpu::util::DeviceExt;
 
 use crate::block::Block;
+use crate::chunk::ChunkPos;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
@@ -35,7 +39,6 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
 
 const NUM_INSTANCES_PER_ROW: u32 = 1;
 const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 1.0, 0.0, NUM_INSTANCES_PER_ROW as f32 * 1.0);
-
 
 
 #[repr(C)]
@@ -146,6 +149,7 @@ for m in obj_materials {
                         position,
                         tex_coords,
                         normal,
+                        texture_index: 0,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -387,7 +391,7 @@ impl CameraController {
         // -------------------------
 
         let speed = if self.fast {
-            self.speed * 5.0
+            self.speed * 20.0
         } else {
             self.speed
         };
@@ -510,11 +514,139 @@ impl Camera {
 
         OPENGL_TO_WGPU_MATRIX * proj * view
     }
+
+pub fn is_box_visible(
+    &self,
+    view_proj: &cgmath::Matrix4<f32>,
+    chunk_position: crate::chunk::ChunkPos,
+    size: f32,
+) -> bool {
+    let matrix = *view_proj;
+
+    // rest of your existing function...
+
+        let origin = chunk_position.world_origin();
+
+        let min = cgmath::Vector3::new(
+            origin[0],
+            origin[1],
+            origin[2],
+        );
+
+        let max = min + cgmath::Vector3::new(
+            size,
+            size,
+            size,
+        );
+
+        // Matrix4 is column-major in cgmath.
+        //
+        // These are the rows of the matrix:
+        //
+        // row 0 = (x.x, y.x, z.x, w.x)
+        // row 1 = (x.y, y.y, z.y, w.y)
+        // row 2 = (x.z, y.z, z.z, w.z)
+        // row 3 = (x.w, y.w, z.w, w.w)
+
+        let row0 = cgmath::Vector4::new(
+            matrix.x.x,
+            matrix.y.x,
+            matrix.z.x,
+            matrix.w.x,
+        );
+
+        let row1 = cgmath::Vector4::new(
+            matrix.x.y,
+            matrix.y.y,
+            matrix.z.y,
+            matrix.w.y,
+        );
+
+        let row2 = cgmath::Vector4::new(
+            matrix.x.z,
+            matrix.y.z,
+            matrix.z.z,
+            matrix.w.z,
+        );
+
+        let row3 = cgmath::Vector4::new(
+            matrix.x.w,
+            matrix.y.w,
+            matrix.z.w,
+            matrix.w.w,
+        );
+
+        let planes = [
+            // Left
+            row3 + row0,
+
+            // Right
+            row3 - row0,
+
+            // Bottom
+            row3 + row1,
+
+            // Top
+            row3 - row1,
+
+            // Near
+            row3 + row2,
+
+            // Far
+            row3 - row2,
+        ];
+
+        for plane in planes {
+            let normal = cgmath::Vector3::new(
+                plane.x,
+                plane.y,
+                plane.z,
+            );
+
+            let length = normal.magnitude();
+
+            if length == 0.0 {
+                continue;
+            }
+
+            let normal = normal / length;
+            let distance = plane.w / length;
+
+            // Select the AABB vertex furthest in the
+            // direction of the plane normal.
+            let positive_vertex = cgmath::Vector3::new(
+                if normal.x >= 0.0 {
+                    max.x
+                } else {
+                    min.x
+                },
+
+                if normal.y >= 0.0 {
+                    max.y
+                } else {
+                    min.y
+                },
+
+                if normal.z >= 0.0 {
+                    max.z
+                } else {
+                    min.z
+                },
+            );
+
+            // Entire box is outside this plane.
+            if normal.dot(positive_vertex) + distance < 0.0 {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 pub struct State {
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
+pub(crate) device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
@@ -535,8 +667,8 @@ pub struct State {
 
     obj_model: Model,
 
-    world: world::World,
-    chunk_meshes: Vec<chunk_mesh::GpuChunkMesh>,
+    pub(crate) world: world::World,
+pub(crate) chunk_meshes: Vec<chunk_mesh::GpuChunkMesh>,
     chunk_pipeline: wgpu::RenderPipeline,
     chunk_material_bind_group: wgpu::BindGroup,
     chunk_texture: Texture,
@@ -544,12 +676,38 @@ pub struct State {
     fps_frames: u32,
     fps_timer: std::time::Instant,
     last_frame: std::time::Instant,
-    chunk_bind_group_layout: wgpu::BindGroupLayout,
+pub(crate) chunk_bind_group_layout: wgpu::BindGroupLayout,
+
+pub(crate) chunk_worker: chunk_worker::ChunkWorker,
+pub(crate) pending_chunks: HashSet<chunk::ChunkPos>,
+pending_remeshes: HashSet<ChunkPos>,
+pub(crate) remesh_again: HashSet<chunk::ChunkPos>,
+pub(crate) lod1_meshes: HashMap<chunk::ChunkPos, chunk_mesh::GpuChunkMesh>,
 }
 
 
 
 impl State {
+
+    fn distance_squared(
+    &self,
+    position: chunk::ChunkPos,
+    size: f32,
+) -> f32 {
+    let origin = position.world_origin();
+
+    let half = size * 0.5;
+
+    let center_x = origin[0] + half;
+    let center_y = origin[1] + half;
+    let center_z = origin[2] + half;
+
+    let dx = center_x - self.camera.position.x;
+    let dy = center_y - self.camera.position.y;
+    let dz = center_z - self.camera.position.z;
+
+    dx * dx + dy * dy + dz * dz
+}
     
     pub fn update_camera(&mut self) {
     let now = std::time::Instant::now();
@@ -719,7 +877,7 @@ let instance_buffer = device.create_buffer_init(
 );
 
 let camera = Camera {
-    position: (0.0, 10.0, 10.0).into(),
+    position: (0.0, 15.0, 10.0).into(),
 
     // Looking roughly toward -Z
     yaw: -std::f32::consts::FRAC_PI_2,
@@ -728,7 +886,7 @@ let camera = Camera {
     aspect: config.width as f32 / config.height as f32,
     fovy: 75.0,
     znear: 0.05,
-    zfar: 5000.0,
+    zfar: 50000.0,
 };
 
     let mut camera_uniform = CameraUniform::new();
@@ -953,49 +1111,20 @@ depth_compare: Some(wgpu::CompareFunction::Less),
         });
 
     let camera_controller = CameraController::new(
-    5.0,
+    15.0,
     0.0025,
 );
     let obj_model =
     load_model("generic.obj", &device, &queue, &texture_bind_group_layout)
         .await
         .expect("load model failed lib:756");
-    let mut world = world::World::new();
 
-let positions = [
-    chunk::ChunkPos { x: 0, y: 0, z: 0 },
-    chunk::ChunkPos { x: 1, y: 0, z: 0 },
-    chunk::ChunkPos { x: 0, y: 0, z: 1 },
-    chunk::ChunkPos { x: 1, y: 0, z: 1 },
-];
 
-// First generate ALL chunks and put them into the world.
-for position in positions {
-    let chunk = world_generator::generate_chunk(position);
-    world.add_chunk(chunk);
-}
+let chunk_worker = chunk_worker::ChunkWorker::new();
 
-// Then build meshes.
-// Now the mesher can see neighboring chunks.
-let mut chunk_meshes = Vec::new();
+let world = world::World::new();
 
-for position in positions {
-    let chunk = world
-        .get_chunk(position)
-        .expect("Chunk was just generated");
-
-    let mesh = chunk_mesh::build_chunk_mesh(chunk, &world);
-
-    let gpu_mesh = chunk_mesh::GpuChunkMesh::new(
-    &device,
-    &mesh,
-    position,
-    &chunk_bind_group_layout,
-);
-
-    chunk_meshes.push(gpu_mesh);
-}
-world.set_block(1, 7, 1, Block::Air);
+let chunk_meshes = Vec::new();
 
 Ok(Self {
     surface,
@@ -1031,6 +1160,13 @@ Ok(Self {
     fps_frames: 0,
     fps_timer: std::time::Instant::now(),
     last_frame: std::time::Instant::now(),
+
+    chunk_worker,
+    pending_chunks: HashSet::new(),
+    pending_remeshes: HashSet::new(),
+    remesh_again: HashSet::new(),
+    lod1_meshes: HashMap::new(),
+    
 })
 
 
@@ -1046,95 +1182,7 @@ Ok(Self {
             self.depth_texture = texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
     }
-
-    fn mark_chunk_and_neighbors_dirty(
-    &mut self,
-    pos: chunk::ChunkPos,
-) {
-    self.world.dirty_chunks.insert(pos);
-
-    let neighbors = [
-        chunk::ChunkPos {
-            x: pos.x - 1,
-            y: pos.y,
-            z: pos.z,
-        },
-        chunk::ChunkPos {
-            x: pos.x + 1,
-            y: pos.y,
-            z: pos.z,
-        },
-        chunk::ChunkPos {
-            x: pos.x,
-            y: pos.y - 1,
-            z: pos.z,
-        },
-        chunk::ChunkPos {
-            x: pos.x,
-            y: pos.y + 1,
-            z: pos.z,
-        },
-        chunk::ChunkPos {
-            x: pos.x,
-            y: pos.y,
-            z: pos.z - 1,
-        },
-        chunk::ChunkPos {
-            x: pos.x,
-            y: pos.y,
-            z: pos.z + 1,
-        },
-    ];
-
-    for neighbor in neighbors {
-        if self.world.chunks.contains_key(&neighbor) {
-            self.world.dirty_chunks.insert(neighbor);
-        }
-    }
-}
-    fn rebuild_dirty_chunks(&mut self) {
-    let dirty_chunks: Vec<chunk::ChunkPos> =
-        self.world.dirty_chunks.drain().collect();
-
-    for position in dirty_chunks {
-        let mesh = {
-            let Some(chunk) = self.world.get_chunk(position) else {
-                continue;
-            };
-
-            chunk_mesh::build_chunk_mesh(
-                chunk,
-                &self.world,
-            )
-        };
-
-        if let Some(gpu_mesh) = self
-            .chunk_meshes
-            .iter_mut()
-            .find(|mesh| mesh.position == position)
-        {
-            // GPU mesh already exists.
-            gpu_mesh.rebuild(
-                &self.device,
-                &mesh,
-            );
-        } else {
-            // New chunk, so create its GPU mesh.
-            let gpu_mesh = chunk_mesh::GpuChunkMesh::new(
-                &self.device,
-                &mesh,
-                position,
-                &self.chunk_bind_group_layout,
-            );
-
-            self.chunk_meshes.push(gpu_mesh);
-        }
-    }
-}
-
-pub fn tick(&mut self, dt: f32) {
-    self.rebuild_dirty_chunks();
-}
+    
 
 
     fn render(&mut self) -> anyhow::Result<()> {
@@ -1142,7 +1190,7 @@ pub fn tick(&mut self, dt: f32) {
     self.fps_frames += 1;
 
     if self.fps_timer.elapsed().as_secs_f32() >= 1.0 {
-        println!("FPS: {}", self.fps_frames);
+        println!("FPS: {} mem: {}", self.fps_frames, self.world.chunks.len());
 
         self.fps_frames = 0;
         self.fps_timer = std::time::Instant::now();
@@ -1232,6 +1280,8 @@ pub fn tick(&mut self, dt: f32) {
 // CHUNK
 // =========================
 
+let view_proj = self.camera.build_view_projection_matrix();
+
 render_pass.set_pipeline(&self.chunk_pipeline);
 
 render_pass.set_bind_group(
@@ -1246,7 +1296,24 @@ render_pass.set_bind_group(
     &[],
 );
 
+
+// ========================================
+// LOD 0
+// ========================================
+
 for chunk_mesh in &self.chunk_meshes {
+    if chunk_mesh.num_indices == 0 {
+        continue;
+    }
+
+    if !self.camera.is_box_visible(
+        &view_proj,
+        chunk_mesh.position,
+        chunk::CHUNK_SIZE as f32,
+    ) {
+        continue;
+    }
+
     render_pass.set_bind_group(
         2,
         &chunk_mesh.bind_group,
@@ -1323,6 +1390,8 @@ impl ApplicationHandler<State> for App {
         #[allow(unused_mut)]
         let mut window_attributes = Window::default_attributes();
         let window = Arc::new(event_loop.create_window(window_attributes).expect("window failed to load lib:953"));
+        window.set_cursor_grab(winit::window::CursorGrabMode::Locked).unwrap();
+        window.set_cursor_visible(false);
         window.set_cursor_visible(false);
 
 

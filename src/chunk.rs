@@ -46,3 +46,24 @@ impl Chunk {
         self.blocks[index] = block;
     }
 }
+
+#[derive(Clone)]
+pub struct ChunkSnapshot {
+    pub position: ChunkPos,
+    pub blocks: Vec<Block>,
+}
+
+impl ChunkSnapshot {
+    pub fn get(&self, x: usize, y: usize, z: usize) -> Block {
+        self.blocks[Chunk::index(x, y, z)]
+    }
+}
+
+impl From<&Chunk> for ChunkSnapshot {
+    fn from(chunk: &Chunk) -> Self {
+        Self {
+            position: chunk.position,
+            blocks: chunk.blocks.clone(),
+        }
+    }
+}

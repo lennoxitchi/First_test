@@ -19,12 +19,14 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) tex_coords: vec2<f32>,
     @location(2) normal: vec3<f32>,
+    @location(3) texture_index: u32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) texture_index: u32,
 };
 
 
@@ -41,6 +43,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
     out.tex_coords = model.tex_coords;
     out.normal = model.normal;
+    out.texture_index = model.texture_index;
 
     return out;
 }
@@ -53,11 +56,40 @@ var t_diffuse: texture_2d<f32>;
 var s_diffuse: sampler;
 
 
+const ATLAS_COLUMNS: f32 = 3.0;
+const ATLAS_ROWS: f32 = 1.0;
+
+fn atlas_uv(
+    uv: vec2<f32>,
+    texture_index: u32
+) -> vec2<f32> {
+    let index = f32(texture_index);
+
+    let column = index % ATLAS_COLUMNS;
+    let row = floor(index / ATLAS_COLUMNS);
+
+    let tile_size = vec2<f32>(
+        1.0 / ATLAS_COLUMNS,
+        1.0 / ATLAS_ROWS
+    );
+
+    return vec2<f32>(
+        column * tile_size.x + uv.x * tile_size.x,
+        row * tile_size.y + uv.y * tile_size.y
+    );
+}
+
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = atlas_uv(
+        fract(in.tex_coords),
+        in.texture_index
+    );
+
     return textureSample(
         t_diffuse,
         s_diffuse,
-        in.tex_coords
+        uv
     );
 }

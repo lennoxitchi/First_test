@@ -1,5 +1,6 @@
 use crate::block::Block;
-use crate::chunk::{Chunk, CHUNK_SIZE};
+use crate::block_model::BlockModel;
+use crate::chunk::{CHUNK_SIZE, Chunk, ChunkSnapshot};
 use crate::model::ModelVertex;
 use wgpu::util::DeviceExt;
 use crate::chunk::ChunkPos;
@@ -83,6 +84,13 @@ impl GpuChunkMesh {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MaskCell {
+    block: Block,
+    positive: bool,
+    texture_index: u32,
+}
+
 impl GpuChunkMesh {
     pub fn rebuild(
         &mut self,
@@ -110,60 +118,326 @@ impl GpuChunkMesh {
 }
 
 pub fn build_chunk_mesh(
-    chunk: &Chunk,
-    world: &world::World,
+    chunk: &ChunkSnapshot,
+    neighbors: &[Option<ChunkSnapshot>; 6],
 ) -> ChunkMesh {
+    build_greedy_mesh(
+        |x, y, z| {
+            get_block(
+                chunk,
+                neighbors,
+                x,
+                y,
+                z,
+            )
+        },
+        1.0,
+    )
+}
+
+fn cube_texture(
+    block: Block,
+    axis: usize,
+    positive: bool,
+) -> u32 {
+    let Some(BlockModel::Cube(cube)) = block.model() else {
+        return 0;
+    };
+
+    match (axis, positive) {
+        // X
+        (0, true) => cube.east,
+        (0, false) => cube.west,
+
+        // Y
+        (1, true) => cube.top,
+        (1, false) => cube.bottom,
+
+        // Z
+        (2, true) => cube.south,
+        (2, false) => cube.north,
+
+        _ => unreachable!(),
+    }
+}
+
+fn build_greedy_mesh<F>(
+    mut get_block: F,
+    scale: f32,
+) -> ChunkMesh
+where
+    F: FnMut(i32, i32, i32) -> Block,
+{
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    for x in 0..CHUNK_SIZE {
-        for y in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                let block = chunk.get(x, y, z);
+    for axis in 0..3 {
+        let (u_axis, v_axis) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            2 => (0, 1),
+            _ => unreachable!(),
+        };
 
-                if block == Block::Air {
-                    continue;
+        for slice in 0..=CHUNK_SIZE {
+            let mut mask: [Option<MaskCell>; CHUNK_SIZE * CHUNK_SIZE] =
+                [None; CHUNK_SIZE * CHUNK_SIZE];
+
+            for v in 0..CHUNK_SIZE {
+                for u in 0..CHUNK_SIZE {
+                    let mut a = [0i32; 3];
+                    let mut b = [0i32; 3];
+
+                    a[axis] = slice as i32 - 1;
+                    b[axis] = slice as i32;
+
+                    a[u_axis] = u as i32;
+                    a[v_axis] = v as i32;
+
+                    b[u_axis] = u as i32;
+                    b[v_axis] = v as i32;
+
+                    let block_a =
+                        get_block(a[0], a[1], a[2]);
+
+                    let block_b =
+                        get_block(b[0], b[1], b[2]);
+
+                    mask[u + v * CHUNK_SIZE] =
+                        if block_a != Block::Air
+    && block_b == Block::Air
+{
+    Some(MaskCell {
+        block: block_a,
+        positive: true,
+        texture_index: cube_texture(
+            block_a,
+            axis,
+            true,
+        ),
+    })
+} else if block_b != Block::Air
+    && block_a == Block::Air
+{
+    Some(MaskCell {
+        block: block_b,
+        positive: false,
+        texture_index: cube_texture(
+            block_b,
+            axis,
+            false,
+        ),
+    })
+} else {
+    None
+}
+                }
+            }
+
+            let mut v = 0;
+
+            while v < CHUNK_SIZE {
+                let mut u = 0;
+
+                while u < CHUNK_SIZE {
+                    let index = u + v * CHUNK_SIZE;
+
+                    let Some(face) = mask[index] else {
+                        u += 1;
+                        continue;
+                    };
+
+                    let block = face.block;
+                    let positive = face.positive;
+                    let texture_index = face.texture_index;
+
+                    let mut width = 1;
+
+                    while u + width < CHUNK_SIZE {
+                        let next =
+                            mask[(u + width) + v * CHUNK_SIZE];
+
+                        if next
+                            != Some(MaskCell {
+                                block,
+                                positive,
+                                texture_index,
+                            })
+                        {
+                            break;
+                        }
+
+                        width += 1;
+                    }
+
+                    let mut height = 1;
+
+                    'height: while v + height < CHUNK_SIZE {
+                        for x in 0..width {
+                            let next =
+                                mask[
+                                    (u + x)
+                                        + (v + height) * CHUNK_SIZE
+                                ];
+
+                            if next
+                                != Some(MaskCell {
+                                    block,
+                                    positive,
+                                    texture_index,
+                                })
+                            {
+                                break 'height;
+                            }
+                        }
+
+                        height += 1;
+                    }
+
+                    add_greedy_quad_scaled(
+                        &mut vertices,
+                        &mut indices,
+                        axis,
+                        slice,
+                        u,
+                        v,
+                        width,
+                        height,
+                        positive,
+                        texture_index,
+                        scale,
+                    );
+
+                    for y in 0..height {
+                        for x in 0..width {
+                            mask[
+                                (u + x)
+                                    + (v + y) * CHUNK_SIZE
+                            ] = None;
+                        }
+                    }
+
+                    u += width;
                 }
 
-                if get_block(chunk, world, x as i32 + 1, y as i32, z as i32) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Right);
-}
-
-if get_block(chunk, world, x as i32 - 1, y as i32, z as i32) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Left);
-}
-
-if get_block(chunk, world, x as i32, y as i32 + 1, z as i32) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Top);
-}
-
-if get_block(chunk, world, x as i32, y as i32 - 1, z as i32) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Bottom);
-}
-
-if get_block(chunk, world, x as i32, y as i32, z as i32 + 1) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Front);
-}
-
-if get_block(chunk, world, x as i32, y as i32, z as i32 - 1) == Block::Air {
-    add_face(&mut vertices, &mut indices, x as f32, y as f32, z as f32, Face::Back);
-}
+                v += 1;
             }
         }
     }
-    
 
-    ChunkMesh { vertices, indices }
+    ChunkMesh {
+        vertices,
+        indices,
+    }
+}
+
+fn add_greedy_quad_scaled(
+    vertices: &mut Vec<ModelVertex>,
+    indices: &mut Vec<u32>,
+    axis: usize,
+    slice: usize,
+    u: usize,
+    v: usize,
+    width: usize,
+    height: usize,
+    positive: bool,
+    texture_index: u32,
+    scale: f32,
+) {
+    let start = vertices.len() as u32;
+
+    let (u_axis, v_axis) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        2 => (0, 1),
+        _ => unreachable!(),
+    };
+
+    let mut origin = [0.0f32; 3];
+
+    origin[axis] = slice as f32 * scale;
+    origin[u_axis] = u as f32 * scale;
+    origin[v_axis] = v as f32 * scale;
+
+    let mut du = [0.0f32; 3];
+    du[u_axis] = width as f32 * scale;
+
+    let mut dv = [0.0f32; 3];
+    dv[v_axis] = height as f32 * scale;
+
+    let p0 = origin;
+
+    let p1 = [
+        origin[0] + du[0],
+        origin[1] + du[1],
+        origin[2] + du[2],
+    ];
+
+    let p2 = [
+        origin[0] + du[0] + dv[0],
+        origin[1] + du[1] + dv[1],
+        origin[2] + du[2] + dv[2],
+    ];
+
+    let p3 = [
+        origin[0] + dv[0],
+        origin[1] + dv[1],
+        origin[2] + dv[2],
+    ];
+
+    let mut normal = [0.0f32; 3];
+
+    normal[axis] =
+        if positive { 1.0 } else { -1.0 };
+
+    let positions = match (axis, positive) {
+        (0, true) => [p0, p1, p2, p3],
+        (0, false) => [p0, p3, p2, p1],
+
+        (1, true) => [p0, p3, p2, p1],
+        (1, false) => [p0, p1, p2, p3],
+
+        (2, true) => [p0, p1, p2, p3],
+        (2, false) => [p0, p3, p2, p1],
+
+        _ => unreachable!(),
+    };
+
+    let tex_coords = [
+        [0.0, height as f32],
+        [width as f32, height as f32],
+        [width as f32, 0.0],
+        [0.0, 0.0],
+    ];
+
+    for i in 0..4 {
+        vertices.push(ModelVertex {
+            position: positions[i],
+            tex_coords: tex_coords[i],
+            normal,
+            texture_index,
+        });
+    }
+
+    indices.extend_from_slice(&[
+        start,
+        start + 1,
+        start + 2,
+
+        start,
+        start + 2,
+        start + 3,
+    ]);
 }
 
 fn get_block(
-    chunk: &Chunk,
-    world: &world::World,
+    chunk: &ChunkSnapshot,
+    neighbors: &[Option<ChunkSnapshot>; 6],
     x: i32,
     y: i32,
     z: i32,
 ) -> Block {
-    // Inside this chunk
+    // Inside current chunk
     if x >= 0
         && x < CHUNK_SIZE as i32
         && y >= 0
@@ -178,151 +452,128 @@ fn get_block(
         );
     }
 
-    // Outside this chunk: determine which neighboring chunk
-    // contains the requested block.
-    let mut chunk_pos = chunk.position;
+    // Only a single axis should be outside here for the
+    // calls made by build_chunk_mesh().
 
-    let mut local_x = x;
-    let mut local_y = y;
-    let mut local_z = z;
+    // -X
+    if x < 0 {
+        if y < 0 || y >= CHUNK_SIZE as i32
+            || z < 0 || z >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
 
-    if local_x < 0 {
-        chunk_pos.x -= 1;
-        local_x += CHUNK_SIZE as i32;
-    } else if local_x >= CHUNK_SIZE as i32 {
-        chunk_pos.x += 1;
-        local_x -= CHUNK_SIZE as i32;
+        return neighbors[0]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    CHUNK_SIZE - 1,
+                    y as usize,
+                    z as usize,
+                )
+            })
+            .unwrap_or(Block::Air);
     }
 
-    if local_y < 0 {
-        chunk_pos.y -= 1;
-        local_y += CHUNK_SIZE as i32;
-    } else if local_y >= CHUNK_SIZE as i32 {
-        chunk_pos.y += 1;
-        local_y -= CHUNK_SIZE as i32;
+    // +X
+    if x >= CHUNK_SIZE as i32 {
+        if y < 0 || y >= CHUNK_SIZE as i32
+            || z < 0 || z >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
+
+        return neighbors[1]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    0,
+                    y as usize,
+                    z as usize,
+                )
+            })
+            .unwrap_or(Block::Air);
     }
 
-    if local_z < 0 {
-        chunk_pos.z -= 1;
-        local_z += CHUNK_SIZE as i32;
-    } else if local_z >= CHUNK_SIZE as i32 {
-        chunk_pos.z += 1;
-        local_z -= CHUNK_SIZE as i32;
+    // -Y
+    if y < 0 {
+        if x < 0 || x >= CHUNK_SIZE as i32
+            || z < 0 || z >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
+
+        return neighbors[2]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    x as usize,
+                    CHUNK_SIZE - 1,
+                    z as usize,
+                )
+            })
+            .unwrap_or(Block::Air);
     }
 
-    match world.get_chunk(chunk_pos) {
-        Some(neighbor) => neighbor.get(
-            local_x as usize,
-            local_y as usize,
-            local_z as usize,
-        ),
-        None => Block::Air,
-    }
-}
+    // +Y
+    if y >= CHUNK_SIZE as i32 {
+        if x < 0 || x >= CHUNK_SIZE as i32
+            || z < 0 || z >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
 
-#[derive(Clone, Copy)]
-enum Face {
-    Right,
-    Left,
-    Top,
-    Bottom,
-    Front,
-    Back,
-}
-
-fn add_face(
-    vertices: &mut Vec<ModelVertex>,
-    indices: &mut Vec<u32>,
-    x: f32,
-    y: f32,
-    z: f32,
-    face: Face,
-) {
-    let start = vertices.len() as u32;
-
-    let (positions, normal) = match face {
-        Face::Right => (
-            [
-                [x + 1.0, y, z],
-                [x + 1.0, y + 1.0, z],
-                [x + 1.0, y + 1.0, z + 1.0],
-                [x + 1.0, y, z + 1.0],
-            ],
-            [1.0, 0.0, 0.0],
-        ),
-
-        Face::Left => (
-            [
-                [x, y, z + 1.0],
-                [x, y + 1.0, z + 1.0],
-                [x, y + 1.0, z],
-                [x, y, z],
-            ],
-            [-1.0, 0.0, 0.0],
-        ),
-
-        Face::Top => (
-            [
-                [x, y + 1.0, z],
-                [x, y + 1.0, z + 1.0],
-                [x + 1.0, y + 1.0, z + 1.0],
-                [x + 1.0, y + 1.0, z],
-            ],
-            [0.0, 1.0, 0.0],
-        ),
-
-        Face::Bottom => (
-            [
-                [x, y, z + 1.0],
-                [x, y, z],
-                [x + 1.0, y, z],
-                [x + 1.0, y, z + 1.0],
-            ],
-            [0.0, -1.0, 0.0],
-        ),
-
-        Face::Front => (
-            [
-                [x + 1.0, y, z + 1.0],
-                [x + 1.0, y + 1.0, z + 1.0],
-                [x, y + 1.0, z + 1.0],
-                [x, y, z + 1.0],
-            ],
-            [0.0, 0.0, 1.0],
-        ),
-
-        Face::Back => (
-            [
-                [x, y, z],
-                [x, y + 1.0, z],
-                [x + 1.0, y + 1.0, z],
-                [x + 1.0, y, z],
-            ],
-            [0.0, 0.0, -1.0],
-        ),
-    };
-
-    let tex_coords = [
-        [0.0, 1.0],
-        [0.0, 0.0],
-        [1.0, 0.0],
-        [1.0, 1.0],
-    ];
-
-    for i in 0..4 {
-        vertices.push(ModelVertex {
-            position: positions[i],
-            tex_coords: tex_coords[i],
-            normal,
-        });
+        return neighbors[3]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    x as usize,
+                    0,
+                    z as usize,
+                )
+            })
+            .unwrap_or(Block::Air);
     }
 
-    indices.extend_from_slice(&[
-        start,
-        start + 1,
-        start + 2,
-        start,
-        start + 2,
-        start + 3,
-    ]);
+    // -Z
+    if z < 0 {
+        if x < 0 || x >= CHUNK_SIZE as i32
+            || y < 0 || y >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
+
+        return neighbors[4]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    x as usize,
+                    y as usize,
+                    CHUNK_SIZE - 1,
+                )
+            })
+            .unwrap_or(Block::Air);
+    }
+
+    // +Z
+    if z >= CHUNK_SIZE as i32 {
+        if x < 0 || x >= CHUNK_SIZE as i32
+            || y < 0 || y >= CHUNK_SIZE as i32
+        {
+            return Block::Air;
+        }
+
+        return neighbors[5]
+            .as_ref()
+            .map(|neighbor| {
+                neighbor.get(
+                    x as usize,
+                    y as usize,
+                    0,
+                )
+            })
+            .unwrap_or(Block::Air);
+    }
+
+    Block::Air
 }
